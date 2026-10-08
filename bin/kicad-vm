@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: ./bin/kicad-vm <command> [configuration|ref]
+
+Commands:
+  up                         Create and provision the VM
+  init [ref]                 Clone KiCad and initialize vcpkg (ref: master)
+  configure [Debug|Release]  Configure CMake
+  build [Debug|Release]      Build KiCad
+  test [Debug|Release]       Run the tests
+  run [Debug|Release]        Start KiCad in the VM
+  clean [Debug|Release]      Clean build artifacts through CMake
+  update                     Update KiCad and vcpkg (fast-forward only)
+  status                     Show environment status
+  shell                      Open PowerShell in the VM
+  ssh-config                 Install an SSH key and write VS Code SSH settings
+  reload | halt | suspend    Manage the VM
+  destroy                    Destroy the VM and all of C:\dev
+EOF
+}
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 2
+fi
+
+command_name=$1
+shift
+
+configure_ssh() {
+  local identity_file="${HOME}/.ssh/kicad-win-dev"
+  local public_key_base64
+  local guest_output
+  local guest_user
+  local ssh_config_file="${PWD}/.vagrant/kicad-win-dev-ssh-config"
+  local user_ssh_config="${HOME}/.ssh/config"
+
+  mkdir -p "${HOME}/.ssh"
+  chmod 700 "${HOME}/.ssh"
+  if [[ ! -f "$identity_file" ]]; then
+    ssh-keygen -q -t ed25519 -N '' -f "$identity_file"
+  fi
+
+  public_key_base64=$(base64 < "${identity_file}.pub" | tr -d '\n')
+  guest_output=$(vagrant winrm --shell powershell --command "\$key = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$public_key_base64')); \$keyPath = 'C:\\ProgramData\\ssh\\administrators_authorized_keys'; New-Item -ItemType Directory -Force -Path (Split-Path \$keyPath) | Out-Null; if (-not (Test-Path \$keyPath) -or -not ((Get-Content -Raw \$keyPath) -like \"*\$key*\")) { Add-Content -Path \$keyPath -Value \$key }; icacls \$keyPath /inheritance:r | Out-Null; icacls \$keyPath /grant:r 'Administrators:(F)' 'SYSTEM:(F)' | Out-Null; Restart-Service sshd; Write-Output \"KICAD_SSH_USER=\$env:USERNAME\"")
+  guest_user=$(printf '%s\n' "$guest_output" | sed -n 's/^KICAD_SSH_USER=//p' | tail -n 1)
+  guest_user=${guest_user:-vagrant}
+
+  mkdir -p "${PWD}/.vagrant"
+  cat > "$ssh_config_file" <<EOF
+Host kicad-win-dev
+  HostName 127.0.0.1
+  Port 2222
+  User $guest_user
+  IdentityFile $identity_file
+  IdentitiesOnly yes
+EOF
+  chmod 600 "$ssh_config_file"
+
+  touch "$user_ssh_config"
+  awk '
+    /^# BEGIN kicad-win-dev$/ { skipping = 1; next }
+    /^# END kicad-win-dev$/ { skipping = 0; next }
+    !skipping { print }
+  ' "$user_ssh_config" > "${user_ssh_config}.tmp"
+  mv "${user_ssh_config}.tmp" "$user_ssh_config"
+  cat >> "$user_ssh_config" <<EOF
+# BEGIN kicad-win-dev
+Host kicad-win-dev
+  HostName 127.0.0.1
+  Port 2222
+  User $guest_user
+  IdentityFile $identity_file
+  IdentitiesOnly yes
+# END kicad-win-dev
+EOF
+  chmod 600 "$user_ssh_config"
+
+  printf 'SSH configuration written to %s\n' "$ssh_config_file"
+  printf 'SSH host kicad-win-dev added to %s\n' "$user_ssh_config"
+  printf 'Test: ssh kicad-win-dev\n'
+  printf 'In VS Code, connect to the kicad-win-dev host and open C:\\dev\\kicad\n'
+}
+
+case "$command_name" in
+  up|reload|halt|suspend|destroy)
+    exec vagrant "$command_name" "$@"
+    ;;
+  shell)
+    exec vagrant powershell
+    ;;
+  ssh-config)
+    configure_ssh
+    exit 0
+    ;;
+  init)
+    ref=${1:-master}
+    if [[ ! "$ref" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+      echo "Invalid KiCad ref: $ref" >&2
+      exit 2
+    fi
+    guest_command="& 'C:\dev\tools\kicad.ps1' -Action bootstrap -Ref '$ref'"
+    ;;
+  configure|build|test|run|clean)
+    configuration=${1:-Debug}
+    if [[ "$configuration" != "Debug" && "$configuration" != "Release" ]]; then
+      echo "Expected configuration: Debug or Release" >&2
+      exit 2
+    fi
+    guest_command="& 'C:\dev\tools\kicad.ps1' -Action '$command_name' -Configuration '$configuration'"
+    ;;
+  update|status)
+    guest_command="& 'C:\dev\tools\kicad.ps1' -Action '$command_name'"
+    ;;
+  help|-h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    echo "Unknown command: $command_name" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+exec vagrant winrm --shell powershell --command "$guest_command"
