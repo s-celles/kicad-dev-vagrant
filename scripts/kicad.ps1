@@ -212,6 +212,7 @@ function Add-BuildRuntimePath {
         (Join-Path $buildRoot 'common'),
         (Join-Path $buildRoot 'api'),
         (Join-Path $buildRoot 'common\gal'),
+        (Join-Path $buildRoot '3d-viewer\3d_cache\sg'),
         $env:Path
     ) -join ';'
 }
