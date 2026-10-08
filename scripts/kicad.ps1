@@ -93,6 +93,14 @@ function Sync-Presets {
     $testBase = $presets.testPresets | Where-Object { $_.name -eq 'test-base' }
     if ($testBase) {
         $testBase | Add-Member -NotePropertyName hidden -NotePropertyValue $true -Force
+        # Run the whole suite and report every failure instead of stopping at
+        # the first one.
+        if ($testBase.execution) {
+            $testBase.execution | Add-Member `
+                -NotePropertyName stopOnFailure `
+                -NotePropertyValue $false `
+                -Force
+        }
     }
 
     $json = $presets | ConvertTo-Json -Depth 100
@@ -184,9 +192,35 @@ function Build-KiCad {
     }
 }
 
+function Get-BuildRoot {
+    $configurePreset, $null = Get-PresetNames
+    return Join-Path $SourceRoot "build\$configurePreset"
+}
+
+# KiCad's shared libraries (kicommon, kigal, ...) and vcpkg's DLLs are not
+# copied next to every executable, so put their directories on PATH.
+function Add-BuildRuntimePath {
+    $buildRoot = Get-BuildRoot
+    $vcpkgBin = if ($Configuration -eq 'Debug') {
+        Join-Path $buildRoot 'vcpkg_installed\x64-windows\debug\bin'
+    } else {
+        Join-Path $buildRoot 'vcpkg_installed\x64-windows\bin'
+    }
+    $env:KICAD_RUN_FROM_BUILD_DIR = '1'
+    $env:Path = @(
+        $vcpkgBin,
+        (Join-Path $buildRoot 'common'),
+        (Join-Path $buildRoot 'api'),
+        (Join-Path $buildRoot 'common\gal'),
+        $env:Path
+    ) -join ';'
+}
+
 function Test-KiCad {
     Assert-SourceTree
+    Sync-Presets
     $null, $testPreset = Get-PresetNames
+    Add-BuildRuntimePath
     Push-Location $SourceRoot
     try {
         cmake --build --preset $testPreset --target qa_python_deps
@@ -201,26 +235,13 @@ function Test-KiCad {
 
 function Start-KiCad {
     Assert-SourceTree
-    $configurePreset, $null = Get-PresetNames
-    $buildRoot = Join-Path $SourceRoot "build\$configurePreset"
+    $buildRoot = Get-BuildRoot
     $executable = Join-Path $buildRoot 'kicad\kicad.exe'
     if (-not (Test-Path $executable)) {
         throw "Executable not found: $executable. Build KiCad first."
     }
 
-    $vcpkgBin = if ($Configuration -eq 'Debug') {
-        Join-Path $buildRoot 'vcpkg_installed\x64-windows\debug\bin'
-    } else {
-        Join-Path $buildRoot 'vcpkg_installed\x64-windows\bin'
-    }
-    $env:KICAD_RUN_FROM_BUILD_DIR = '1'
-    $env:Path = @(
-        $vcpkgBin,
-        (Join-Path $buildRoot 'common'),
-        (Join-Path $buildRoot 'api'),
-        (Join-Path $buildRoot 'common\gal'),
-        $env:Path
-    ) -join ';'
+    Add-BuildRuntimePath
     Start-Process -FilePath $executable -WorkingDirectory (Split-Path $executable)
     Write-Host "KiCad started from $buildRoot"
 }
